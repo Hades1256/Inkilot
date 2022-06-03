@@ -1,0 +1,112 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+ name: somedeploymentname
+  labels:
+    env: test
+    project: test
+spec:
+ selector:
+   matchLabels:
+     app: app-test
+ #Изначальный запуск двух экземпляров для коррекции при помощи балансировщика 
+ #начаольной нагрузки с замедленной обработкой "первых запросов"
+ replicas: 2
+ template:
+   metadata:
+     labels:
+       app: app-test
+   spec:
+     containers:
+     - name: podname
+       image: subdomain.domain.ru/images/podproject_1:1.0.0.0-00001
+       resources:
+         requests:
+           cpu: 100m
+           memory: "128Mi"
+         limits:
+           #видел рекомендацию не использовать ограничение на использование cpu сверху,
+           #т.к. есть баг при любой нагрузке вызывающий троттлинг. Предлагается использовать метки и толерантность
+           cpu: 100m
+           memory: "130Mi"
+       ports:
+       - name: testdeployment
+         containerPort: 3184
+
+
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: somedeploymentname-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: somedeploymentname
+  minReplicas: 1
+  maxReplicas: 10
+status:
+  observedGeneration: 1
+  lastScaleTime: <some-time>
+  currentReplicas: 1
+  desiredReplicas: 1
+  currentMetrics:
+  - type: Resource
+    resource:
+      name: cpu
+      current:
+        averageUtilization: 0
+        averageValue: 0
+
+        
+        
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: somedeploymentname-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: somedeploymentname
+  minReplicas: 2
+  maxReplicas: 4
+  behavior:
+    scaleDown:
+      # "Не спешим понижать число запущенных подов. Для запуска требуется время."
+      stabilizationWindowSeconds: 60
+      policies:
+      - type: Pods
+        value: 1
+        periodSeconds: 20
+      # В результате при нагрузке 74,9%(толекрантность 0,1)  будет отключаться 1 Под. Распределённая нагрузка будет
+      # 99,97% по всем оставшимся Подам в условиях: max=2500запросов/под и 75% нагрузке для решения отключения одного из подов.
+    scaleUp:
+      # Даём двойное время от расчётного на стабилизацию и обработку "первых запросов"
+      stabilizationWindowSeconds: 20
+
+
+  metrics:
+  # Т.к. не сказано ничего какого типа запросы идут, а они явно сетевые,
+  # будем отталкивать от числа пакетов(видимо сумма входящих и исходящих)
+  # так и от число конкретно поступающих запросов 
+  
+  # Предположим, что 1 под способен обработать в 2,5 раза больше запросов, чем приходит ночью. Это следует из условий задачи.
+  # Полагаем, например, что в пике бывает до 10к запросов в секунду, а в ночное время в таком случае до 1000, настроим ,что 
+  # необходимая нагрузка для запуска следующего пода более 75% при макс. нагрузке на под 2,5к запросов/секунду:
+  - type: Object
+    object:
+      metric:
+        name: requests-per-second
+      describedObject:
+        apiVersion: networking.k8s.io/v1
+        kind: Ingress
+        name: main-route
+      target:
+        type: Value
+        value: 1875
+        # как итог при 
+  # Т.к. нагрузка на cpu незначительна, то использовать в качестве метрики мониторинга не целесообразно,
+  # плюс необходим некоторый трэшхолд в начале для переход в рабочее устойчвое состояние
+# считаем, что в качестве метрики в сервисе заложена возможность мониторинга числа запросов.
+# На эту метрику и опираемся
